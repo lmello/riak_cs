@@ -26,6 +26,7 @@
 
 -include("riak_cs.hrl").
 -include("s3_api.hrl").
+-include("oos_api.hrl").
 -include_lib("webmachine/include/webmachine.hrl").
 
 -ifdef(TEST).
@@ -34,103 +35,79 @@
 
 -define(QS_KEYID, "AWSAccessKeyId").
 -define(QS_SIGNATURE, "Signature").
--define(S3_API_MOD, riak_cs_s3_rewrite).
--define(OOS_API_MOD, riak_cs_oos_rewrite).
 
 %% ===================================================================
 %% Public API
 %% ===================================================================
 
--spec identify(term(), term()) -> {string() | undefined , string()}.
-identify(RD, Ctx) ->
-    identify(RD, Ctx, api()).
+-spec identify(term(), term()) -> failed | {string() | undefined , string()}.
+identify(RD, #context{api=s3}) ->
+    case wrq:get_req_header("authorization", RD) of
+        undefined ->
+            {wrq:get_qs_value(?QS_KEYID, RD), wrq:get_qs_value(?QS_SIGNATURE, RD)};
+        AuthHeader ->
+            parse_auth_header(AuthHeader)
+    end;
+identify(RD, #context{api=oos}) ->
+    validate_token(wrq:get_req_header("x-auth-token", RD)).
 
 -spec authenticate(rcs_user(), string(), term(), term()) -> ok | {error, atom()}.
-authenticate(User, Signature, RD, Ctx) ->
-    authenticate(User, Signature, RD, Ctx, api()).
+authenticate(User, Signature, RD, #context{api=s3}) ->
+    CalculatedSignature = calculate_signature(User?RCS_USER.key_secret, RD),
+    case check_auth(Signature, CalculatedSignature) of
+        true ->
+            Expires = wrq:get_qs_value("Expires", RD),
+            case Expires of
+                undefined ->
+                    ok;
+                _ ->
+                    {MegaSecs, Secs, _} = os:timestamp(),
+                    Now = (MegaSecs * 1000000) + Secs,
+                    case Now > list_to_integer(Expires) of
+                        true ->
+                            %% @TODO Not sure if this is the proper error
+                            %% to return; will have to check after testing.
+                            {error, invalid_authentication};
+                        false ->
+                            ok
+                    end
+            end;
+        _ ->
+            {error, invalid_authentication}
+    end;
+authenticate(_User, _UserInfo, _RD, #context{api=oos}) ->
+    %% @TODO Verify that the set of user roles contains a valid
+    %% operator role
+    %% @TODO Expand authentication check for non-operators who may
+    %% have access
+    ok.
+
 
 %% ===================================================================
 %% Internal functions
 %% ===================================================================
 
--spec identify(term(), term(), s3 | oos) -> {string() | undefined , string()}.
-identify(RD, _Ctx, s3) ->
-    case wrq:get_req_header("authorization", RD) of
-        undefined ->
-            {wrq:get_qs_value(?QS_KEYID, RD), wrq:get_qs_value(?QS_SIGNATURE, RD)};
-        AuthHeader ->
-            parse_auth_header(AuthHeader)
-    end;
-identify(RD, _Ctx, oos) ->
-    case wrq:get_req_header("authorization", RD) of
-        undefined ->
-            {wrq:get_qs_value(?QS_KEYID, RD), wrq:get_qs_value(?QS_SIGNATURE, RD)};
-        AuthHeader ->
-            parse_auth_header(AuthHeader)
-    end.
+-spec validate_token(undefined | string()) -> failed | {term(), term()}.
+validate_token(undefined) ->
+    failed;
+validate_token(AuthToken) ->
+    %% @TODO Check token cache
+    %% @TODO Ensure token is not in revoked tokens list
+    %% Request token info and determine tenant
+    %% OS tenant id maps to Riak CS key id.
+    handle_token_info_response(
+      request_keystone_token_info(AuthToken)).
 
--spec authenticate(rcs_user(), string(), term(), term(), s3 | oos) -> ok | {error, atom()}.
-authenticate(User, Signature, RD, _Ctx, s3) ->
-    CalculatedSignature = calculate_signature(User?RCS_USER.key_secret, RD),
-    case check_auth(Signature, CalculatedSignature) of
-        true ->
-            Expires = wrq:get_qs_value("Expires", RD),
-            case Expires of
-                undefined ->
-                    ok;
-                _ ->
-                    {MegaSecs, Secs, _} = os:timestamp(),
-                    Now = (MegaSecs * 1000000) + Secs,
-                    case Now > list_to_integer(Expires) of
-                        true ->
-                            %% @TODO Not sure if this is the proper error
-                            %% to return; will have to check after testing.
-                            {error, invalid_authentication};
-                        false ->
-                            ok
-                    end
-            end;
-        _ ->
-            {error, invalid_authentication}
-    end;
-authenticate(User, Signature, RD, _Ctx, oos) ->
-    %% @TODO Contact keystone auth server to get verify user and
-    %% get info.
-    %% @TODO Calculate signature and compare
-    CalculatedSignature = calculate_signature(User?RCS_USER.key_secret, RD),
-    case check_auth(Signature, CalculatedSignature) of
-        true ->
-            Expires = wrq:get_qs_value("Expires", RD),
-            case Expires of
-                undefined ->
-                    ok;
-                _ ->
-                    {MegaSecs, Secs, _} = os:timestamp(),
-                    Now = (MegaSecs * 1000000) + Secs,
-                    case Now > list_to_integer(Expires) of
-                        true ->
-                            %% @TODO Not sure if this is the proper error
-                            %% to return; will have to check after testing.
-                            {error, invalid_authentication};
-                        false ->
-                            ok
-                    end
-            end;
-        _ ->
-            {error, invalid_authentication}
-    end.
+request_keystone_token_info(_AuthToken) ->
+    {ok, user_info_here}.
 
--spec api() -> s3 | oos.
-api() ->
-    api(application:get_env(riak_cs, rewrite_module)).
+handle_token_info_response(invalid_token) ->
+    failed;
+handle_token_info_response(UserInfo) ->
+    {tenant_id(UserInfo), UserInfo}.
 
--spec api({ok, atom()} | undefined) -> s3 | oos.
-api({ok, ?S3_API_MOD}) ->
-    s3;
-api({ok, ?OOS_API_MOD}) ->
-    oos;
-api(undefined) ->
-    oos.
+tenant_id(_UserInfo) ->
+    ok.
 
 parse_auth_header("AWS " ++ Key) ->
     case string:tokens(Key, ":") of
