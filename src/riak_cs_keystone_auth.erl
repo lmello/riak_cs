@@ -82,7 +82,6 @@ authenticate(_User, _UserInfo, _RD, #context{api=oos}) ->
     %% have access
     ok.
 
-
 %% ===================================================================
 %% Internal functions
 %% ===================================================================
@@ -98,16 +97,29 @@ validate_token(AuthToken) ->
     handle_token_info_response(
       request_keystone_token_info(AuthToken)).
 
-request_keystone_token_info(_AuthToken) ->
-    {ok, user_info_here}.
+request_keystone_token_info(AuthToken) ->
+    RequestURI = auth_url() ++ AuthToken,
+    RequestHeaders = [{"X-Auth-Token", os_admin_token()}],
+    httpc:request(get, {RequestURI, RequestHeaders}, [], []).
 
-handle_token_info_response(invalid_token) ->
+handle_token_info_response({ok, {{_HTTPVer, _Status, _StatusLine}, _, TokenInfo}})
+  when _Status >= 200, _Status =< 299 ->
+    {tenant_id(TokenInfo), TokenInfo};
+handle_token_info_response({ok, {{_HTTPVer, _Status, _StatusLine}, _, _}}) ->
     failed;
-handle_token_info_response(UserInfo) ->
-    {tenant_id(UserInfo), UserInfo}.
+handle_token_info_response({error, Reason}) ->
+    lager:warning("Error occurred requesting token from keystone. Reason: ~p",
+                  [Reason]),
+    failed.
 
-tenant_id(_UserInfo) ->
+tenant_id(UserInfo) ->
     ok.
+
+auth_url() ->
+    riak_cs_utils:get_env(riak_cs, os_auth_url, ?DEFAULT_OS_AUTH_URL).
+
+os_admin_token() ->
+    riak_cs_utils:get_env(riak_cs, os_admin_token, ?DEFAULT_OS_ADMIN_TOKEN).
 
 parse_auth_header("AWS " ++ Key) ->
     case string:tokens(Key, ":") of
