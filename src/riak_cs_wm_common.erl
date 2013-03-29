@@ -59,6 +59,9 @@
 -include("riak_cs.hrl").
 -include_lib("webmachine/include/webmachine.hrl").
 
+-define(S3_API_MOD, riak_cs_s3_rewrite).
+-define(OOS_API_MOD, riak_cs_oos_rewrite).
+
 %% ===================================================================
 %% Webmachine callbacks
 %% ===================================================================
@@ -79,7 +82,8 @@ init(Config) ->
                    policy_module=PolicyModule,
                    exports_fun=ExportsFun,
                    start_time=os:timestamp(),
-                   submodule=Mod},
+                   submodule=Mod,
+                   api=api()},
     resource_call(Mod, init, [Ctx], ExportsFun).
 
 -spec service_available(#wm_reqdata{}, #context{}) -> {boolean(), #wm_reqdata{}, #context{}}.
@@ -152,25 +156,22 @@ forbidden(RD, Ctx=#context{auth_module=AuthMod,
                            submodule=Mod,
                            riakc_pid=RiakPid,
                            exports_fun=ExportsFun}) ->
-    {UserKey, AuthData} = AuthMod:identify(RD, Ctx),
-    riak_cs_dtrace:dt_wm_entry({?MODULE, Mod}, <<"forbidden">>, [], [riak_cs_wm_utils:extract_name(UserKey)]),
-    AuthResult = case riak_cs_utils:get_user(UserKey, RiakPid) of
-                     {ok, {User, UserObj}} when User?RCS_USER.status =:= enabled ->
-                         authenticate(User, UserObj, RD, Ctx, AuthData);
-                     %% {ok, _} -> %% disabled account, we are going to 403
-                     {ok, {User, _UserObj}} when User?RCS_USER.status =/= enabled ->
-                         {error, bad_auth};
-                     {error, NE} when NE =:= not_found;
-                                      NE =:= notfound;
-                                      NE =:= no_user_key ->
-                         {error, NE};
-                     {error, R} ->
-                         %% other failures, like Riak fetch timeout, be loud about
-                         _ = lager:error("Retrieval of user record for ~p failed. Reason: ~p",
-                                         [UserKey, R]),
-                         {error, R}
-                 end,
-    AnonOk = resource_call(Mod, anon_ok, [], ExportsFun),
+    {AuthResult, AnonOk} =
+        case AuthMod:identify(RD, Ctx) of
+            {UserKey, AuthData} ->
+                riak_cs_dtrace:dt_wm_entry({?MODULE, Mod},
+                                           <<"forbidden">>,
+                                           [],
+                                           [riak_cs_wm_utils:extract_name(UserKey)]),
+                UserLookupResult = maybe_create_user(
+                                     riak_cs_utils:get_user(UserKey, RiakPid),
+                                     Ctx#context.api),
+                {authenticate(UserLookupResult, RD, Ctx, AuthData),
+                 resource_call(Mod, anon_ok, [], ExportsFun)};
+            failed ->
+                %% Identification failed, deny access
+                {{error, no_such_key}, false}
+        end,
     case post_authentication(AuthResult, RD, Ctx, fun authorize/2, AnonOk) of
         {false, _RD2, Ctx2} = FalseRet ->
             riak_cs_dtrace:dt_wm_return({?MODULE, Mod}, <<"forbidden">>, [], [riak_cs_wm_utils:extract_name(Ctx2#context.user), <<"false">>]),
@@ -184,6 +185,18 @@ forbidden(RD, Ctx=#context{auth_module=AuthMod,
             riak_cs_dtrace:dt_wm_return({?MODULE, Mod}, <<"forbidden">>, [Reason], [riak_cs_wm_utils:extract_name(Ctx2#context.user), <<"true">>]),
             Ret
     end.
+
+maybe_create_user({ok, {_, _}}=UserResult, _) ->
+    UserResult;
+maybe_create_user({error, NE}, oos) when NE =:= not_found;
+                                         NE =:= notfound;
+                                         NE =:= no_user_key ->
+    %% @TODO Attempt to create a Riak CS user to represent the OS tenant
+    undefined;
+maybe_create_user({error, Reason}=Error, Api) ->
+    _ = lager:error("Retrieval of user record for ~p failed. Reason: ~p",
+                    [Api, Reason]),
+    Error.
 
 %% @doc Get the list of methods a resource supports.
 -spec allowed_methods(#wm_reqdata{}, #context{}) -> {[atom()], #wm_reqdata{}, #context{}}.
@@ -362,9 +375,11 @@ authorize(RD,Ctx=#context{submodule=Mod, exports_fun=ExportsFun}) ->
     end,
     R.
 
--spec authenticate(rcs_user(), riakc_obj:riakc_obj(), term(), term(), term()) ->
+-type user_lookup_result() :: {ok, {rcs_user(), riakc_obj:riakc_obj()}} | {error, term()}.
+-spec authenticate(user_lookup_result(), term(), term(), term()) ->
                           {ok, rcs_user(), riakc_obj:riakc_obj()} | {error, term()}.
-authenticate(User, UserObj, RD, Ctx=#context{auth_module=AuthMod, submodule=Mod}, AuthData) ->
+authenticate({ok, {User, UserObj}}, RD, Ctx=#context{auth_module=AuthMod, submodule=Mod}, AuthData)
+  when User?RCS_USER.status =:= enabled ->
     riak_cs_dtrace:dt_wm_entry({?MODULE, Mod}, <<"authenticate">>, [], [atom_to_binary(AuthMod, latin1)]),
     case AuthMod:authenticate(User, AuthData, RD, Ctx) of
         ok ->
@@ -373,7 +388,13 @@ authenticate(User, UserObj, RD, Ctx=#context{auth_module=AuthMod, submodule=Mod}
         {error, _Reason} ->
             riak_cs_dtrace:dt_wm_return({?MODULE, Mod}, <<"authenticate">>, [0], [atom_to_binary(AuthMod, latin1)]),
             {error, bad_auth}
-    end.
+    end;
+authenticate({ok, {User, _UserObj}}, _RD, _Ctx, _AuthData)
+  when User?RCS_USER.status =/= enabled ->
+    %% {ok, _} -> %% disabled account, we are going to 403
+    {error, bad_auth};
+authenticate({error, _}=Error, _RD, _Ctx, _AuthData) ->
+    Error.
 
 -spec exports_fun(orddict:orddict()) -> function().
 exports_fun(Exports) ->
@@ -488,3 +509,15 @@ default_anon_ok() ->
 -spec default_authorize(term(), term()) -> {false, term(), term()}.
 default_authorize(RD, Ctx) ->
     {false, RD, Ctx}.
+
+-spec api() -> s3 | oos.
+api() ->
+    api(application:get_env(riak_cs, rewrite_module)).
+
+-spec api({ok, atom()} | undefined) -> s3 | oos.
+api({ok, ?S3_API_MOD}) ->
+    s3;
+api({ok, ?OOS_API_MOD}) ->
+    oos;
+api(undefined) ->
+    oos.

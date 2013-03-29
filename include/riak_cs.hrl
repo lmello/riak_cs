@@ -87,7 +87,8 @@
                   exports_fun :: function(),
                   auth_module :: atom(),
                   policy_module :: atom(),
-                  local_context :: term()
+                  local_context :: term(),
+                  api :: atom()
                  }).
 
 -record(key_context, {context :: #context{},
