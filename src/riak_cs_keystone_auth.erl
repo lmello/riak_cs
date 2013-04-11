@@ -22,6 +22,8 @@
 
 -behavior(riak_cs_auth).
 
+-compile(export_all).
+
 -export([identify/2, authenticate/4]).
 
 -include("riak_cs.hrl").
@@ -42,40 +44,12 @@
 
 -spec identify(term(), term()) -> failed | {string() | undefined , string()}.
 identify(RD, #context{api=s3}) ->
-    case wrq:get_req_header("authorization", RD) of
-        undefined ->
-            {wrq:get_qs_value(?QS_KEYID, RD), wrq:get_qs_value(?QS_SIGNATURE, RD)};
-        AuthHeader ->
-            parse_auth_header(AuthHeader)
-    end;
+    validate_token(s3, RD);
 identify(RD, #context{api=oos}) ->
-    validate_token(wrq:get_req_header("x-auth-token", RD)).
+    validate_token(oos, wrq:get_req_header("x-auth-token", RD)).
 
 -spec authenticate(rcs_user(), string(), term(), term()) -> ok | {error, atom()}.
-authenticate(User, Signature, RD, #context{api=s3}) ->
-    CalculatedSignature = calculate_signature(User?RCS_USER.key_secret, RD),
-    case check_auth(Signature, CalculatedSignature) of
-        true ->
-            Expires = wrq:get_qs_value("Expires", RD),
-            case Expires of
-                undefined ->
-                    ok;
-                _ ->
-                    {MegaSecs, Secs, _} = os:timestamp(),
-                    Now = (MegaSecs * 1000000) + Secs,
-                    case Now > list_to_integer(Expires) of
-                        true ->
-                            %% @TODO Not sure if this is the proper error
-                            %% to return; will have to check after testing.
-                            {error, invalid_authentication};
-                        false ->
-                            ok
-                    end
-            end;
-        _ ->
-            {error, invalid_authentication}
-    end;
-authenticate(_User, TokenItems, _RD, #context{api=oos}) ->
+authenticate(_User, TokenItems, _RD, _Ctx) ->
     %% @TODO Expand authentication check for non-operators who may
     %% have access
     %% @TODO Can we rely on role names along or must the service id
@@ -102,21 +76,39 @@ token_names(Roles) ->
     ordsets:from_list(
       [proplists:get_value(<<"name">>, Role, []) || {struct, Role} <- Roles]).
 
--spec validate_token(undefined | string()) -> failed | {term(), term()}.
-validate_token(undefined) ->
+-spec validate_token(s3 | oos, undefined | string()) -> failed | {term(), term()}.
+validate_token(_, undefined) ->
     failed;
-validate_token(AuthToken) ->
+validate_token(Api, AuthToken) ->
     %% @TODO Check token cache
     %% @TODO Ensure token is not in revoked tokens list
     %% Request token info and determine tenant
-    %% OS tenant id maps to Riak CS key id.
+    %% OS tenant id may map to Riak CS key id.
     handle_token_info_response(
-      request_keystone_token_info(AuthToken)).
+      request_keystone_token_info(Api, AuthToken)).
 
-request_keystone_token_info(AuthToken) ->
+-spec request_keystone_token_info(s3 | oos, string() | {term(), term()}) -> term().
+request_keystone_token_info(oos, AuthToken) ->
     RequestURI = auth_url() ++ AuthToken,
     RequestHeaders = [{"X-Auth-Token", os_admin_token()}],
-    httpc:request(get, {RequestURI, RequestHeaders}, [], []).
+    httpc:request(get, {RequestURI, RequestHeaders}, [], []);
+request_keystone_token_info(s3, RD) ->
+    {KeyId, Signature}  = case wrq:get_req_header("authorization", RD) of
+                              undefined ->
+                                  {wrq:get_qs_value(?QS_KEYID, RD), wrq:get_qs_value(?QS_SIGNATURE, RD)};
+                              AuthHeader ->
+                                  parse_auth_header(AuthHeader)
+                          end,
+    RequestURI = s3_auth_url(),
+    STS = base64url:encode_to_string(calculate_sts(RD)),
+    RequestBody = s3_token_json(KeyId, Signature, STS),
+    httpc:request(post, {RequestURI, [], "application/json", RequestBody}, [], []).
+
+s3_token_json(KeyId, Signature, STS) ->
+    Inner = {struct, [{<<"access">>, list_to_binary(KeyId)},
+                      {<<"signature">>, list_to_binary(Signature)},
+                      {<<"token">>, list_to_binary(STS)}]},
+    mochijson2:encode({struct, [{<<"credentials">>, Inner}]}).
 
 handle_token_info_response({ok, {{_HTTPVer, _Status, _StatusLine}, _, TokenInfo}})
   when _Status >= 200, _Status =< 299 ->
@@ -156,6 +148,9 @@ operator_roles() ->
 auth_url() ->
     riak_cs_utils:get_env(riak_cs, os_auth_url, ?DEFAULT_OS_AUTH_URL).
 
+s3_auth_url() ->
+    riak_cs_utils:get_env(riak_cs, s3_auth_url, ?DEFAULT_S3_AUTH_URL).
+
 os_admin_token() ->
     riak_cs_utils:get_env(riak_cs, os_admin_token, ?DEFAULT_OS_ADMIN_TOKEN).
 
@@ -168,7 +163,7 @@ parse_auth_header("AWS " ++ Key) ->
 parse_auth_header(_) ->
     {undefined, undefined}.
 
-calculate_signature(KeyData, RD) ->
+calculate_sts(RD) ->
     Headers = riak_cs_wm_utils:normalize_headers(RD),
     AmazonHeaders = riak_cs_wm_utils:extract_amazon_headers(Headers),
     OriginalResource = riak_cs_s3_rewrite:original_resource(RD),
@@ -200,19 +195,14 @@ calculate_signature(KeyData, RD) ->
         ContentType ->
             ok
     end,
-    STS = [atom_to_list(wrq:method(RD)), "\n",
-           CMD5,
-           "\n",
-           ContentType,
-           "\n",
-           Date,
-           AmazonHeaders,
-           Resource],
-    base64:encode_to_string(
-      crypto:sha_mac(KeyData, STS)).
-
-check_auth(PresentedSignature, CalculatedSignature) ->
-    PresentedSignature == CalculatedSignature.
+    [atom_to_list(wrq:method(RD)), "\n",
+     CMD5,
+     "\n",
+     ContentType,
+     "\n",
+     Date,
+     AmazonHeaders,
+     Resource].
 
 canonicalize_qs(QS) ->
     canonicalize_qs(QS, []).

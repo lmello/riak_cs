@@ -20,5 +20,6 @@
 
 -define(DEFAULT_OS_ROOT_HOST, "storage.swiftdrive.com").
 -define(DEFAULT_OS_AUTH_URL, "http://localhost:35357/v2.0/tokens/").
+-define(DEFAULT_S3_AUTH_URL, "http://localhost:35357/v2.0/s3tokens/").
 -define(DEFAULT_OS_ADMIN_TOKEN, "ADMIN").
 -define(DEFAULT_OS_OPERATOR_ROLES, [<<"admin">>, <<"swiftoperator">>]).

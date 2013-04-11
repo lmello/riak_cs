@@ -192,6 +192,8 @@ maybe_create_user({error, NE}, oos) when NE =:= not_found;
                                          NE =:= notfound;
                                          NE =:= no_user_key ->
     %% @TODO Attempt to create a Riak CS user to represent the OS tenant
+    %% @TODO Get the user's key secret
+    %% GET /v2.0/users/<user-id>/credentials/OS-EC2/<ec2-access-key>
     undefined;
 maybe_create_user({error, Reason}=Error, Api) ->
     _ = lager:error("Retrieval of user record for ~p failed. Reason: ~p",

@@ -109,7 +109,8 @@ anonymous_user_creation() ->
     EnvResponse = application:get_env(riak_cs, anonymous_user_creation),
     handle_env_response(EnvResponse, false).
 
-%% @doc Convert the passed binary into a string where the numbers are represented in hexadecimal (lowercase and 0 prefilled).
+%% @doc Convert the passed binary into a string where the numbers are
+%% represented in hexadecimal (lowercase and 0 prefilled).
 -spec binary_to_hexlist(binary()) -> string().
 binary_to_hexlist(Bin) ->
     XBin =
@@ -136,7 +137,8 @@ etag_from_binary(Binary) ->
 etag_from_binary_no_quotes(Binary) ->
     binary_to_hexlist(Binary).
 
-%% @doc Convert the passed binary into a string where the numbers are represented in hexadecimal (lowercase and 0 prefilled).
+%% @doc Convert the passed binary into a string where the numbers are
+%% represented in hexadecimal (lowercase and 0 prefilled).
 -spec hexlist_to_binary(string()) -> binary().
 hexlist_to_binary(String) ->
     Bytes = length(String) div 2,
