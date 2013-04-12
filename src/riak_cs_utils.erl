@@ -24,6 +24,7 @@
 
 %% Public API
 -export([anonymous_user_creation/0,
+         api/0,
          etag_from_binary/1,
          etag_from_binary_no_quotes/1,
          check_bucket_exists/2,
@@ -89,6 +90,9 @@
 -ifdef(TEST).
 -compile(export_all).
 -endif.
+
+-define(S3_API_MOD, riak_cs_s3_rewrite).
+-define(OOS_API_MOD, riak_cs_oos_rewrite).
 
 -define(OBJECT_BUCKET_PREFIX, <<"0o:">>).       % Version # = 0
 -define(BLOCK_BUCKET_PREFIX, <<"0b:">>).        % Version # = 0
@@ -284,7 +288,12 @@ create_credentialed_user({ok, AdminCreds}, User) ->
 handle_create_user(ok, User) ->
     {ok, User};
 handle_create_user({error, {error_status, _, _, ErrorDoc}}, _User) ->
-    riak_cs_s3_response:error_response(ErrorDoc);
+    case api() of
+        s3 ->
+            riak_cs_s3_response:error_response(ErrorDoc);
+        oos ->
+            {error, ErrorDoc}
+    end;
 handle_create_user({error, _}=Error, _User) ->
     Error.
 
@@ -1521,3 +1530,15 @@ set_md5_chunk_size(Size) when is_integer(Size) andalso Size > 0 ->
     application:set_env(riak_cs, md5_chunk_size, Size);
 set_md5_chunk_size(_) ->
     {error, invalid_value}.
+
+-spec api() -> s3 | oos.
+api() ->
+    api(application:get_env(riak_cs, rewrite_module)).
+
+-spec api({ok, atom()} | undefined) -> s3 | oos.
+api({ok, ?S3_API_MOD}) ->
+    s3;
+api({ok, ?OOS_API_MOD}) ->
+    oos;
+api(undefined) ->
+    oos.

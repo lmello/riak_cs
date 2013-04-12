@@ -23,3 +23,4 @@
 -define(DEFAULT_S3_AUTH_URL, "http://localhost:35357/v2.0/s3tokens/").
 -define(DEFAULT_OS_ADMIN_TOKEN, "ADMIN").
 -define(DEFAULT_OS_OPERATOR_ROLES, [<<"admin">>, <<"swiftoperator">>]).
+-define(DEFAULT_OS_USERS_URL, "http://localhost:35357/v2.0/users/").

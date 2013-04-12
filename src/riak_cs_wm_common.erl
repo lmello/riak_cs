@@ -20,6 +20,9 @@
 
 -module(riak_cs_wm_common).
 
+%% @TODO REMOVE THIS
+-compile(export_all).
+
 -export([init/1,
          service_available/2,
          forbidden/2,
@@ -57,6 +60,7 @@
          default_anon_ok/0]).
 
 -include("riak_cs.hrl").
+-include("oos_api.hrl").
 -include_lib("webmachine/include/webmachine.hrl").
 
 -define(S3_API_MOD, riak_cs_s3_rewrite).
@@ -83,7 +87,7 @@ init(Config) ->
                    exports_fun=ExportsFun,
                    start_time=os:timestamp(),
                    submodule=Mod,
-                   api=api()},
+                   api=riak_cs_utils:api()},
     resource_call(Mod, init, [Ctx], ExportsFun).
 
 -spec service_available(#wm_reqdata{}, #context{}) -> {boolean(), #wm_reqdata{}, #context{}}.
@@ -193,25 +197,97 @@ maybe_create_user({error, NE}, oos, AuthData) when NE =:= not_found;
                                                    NE =:= notfound;
                                                    NE =:= no_user_key ->
     %% @TODO Attempt to create a Riak CS user to represent the OS tenant
-    {TenantId, _TokenItems} = AuthData,
+    {TenantId, TokenItems} = AuthData,
     %% @TODO Get username from `TokenItems'
     %% @TODO Get user's email
-    %% GET /v2.0/users/<user-id>
     %% @TODO Get the user's key secret
-    %% GET /v2.0/users/<user-id>/credentials/OS-EC2/<ec2-access-key>
-    %% If the user does not have ec2 credentials, then set `key_secret'
+    %% GET /v2.0/users/<user-id>/credentials/OS-EC2
+    %% If the user does not have ec2 credentials for the tenant, then set `key_secret'
     %% to `undefined'.
-    Name = "",
-    Email = "",
-    Secret = "",
-    handle_create_user_response(riak_cs_utils:create_user(Name, Email, TenantId, Secret));
+    UserId = token_user_id(TokenItems),
+    {Name, Email} = get_os_user_data(UserId),
+    {_ ,Secret} = get_ec2_creds(UserId, TenantId),
+    KeyId = TenantId ++ ":" ++ UserId,
+    riak_cs_utils:create_user(Name, Email, KeyId, Secret);
 maybe_create_user({error, Reason}=Error, Api, _) ->
     _ = lager:error("Retrieval of user record for ~p failed. Reason: ~p",
                     [Api, Reason]),
     Error.
 
-handle_create_user_response(ok) ->
-    ok.
+token_user_id(TokenItems) ->
+    {struct, AccessItems} = proplists:get_value(<<"access">>, TokenItems, []),
+    {struct, UserItems} = proplists:get_value(<<"user">>, AccessItems, []),
+    proplists:get_value(<<"id">>, UserItems).
+
+get_os_user_data(undefined) ->
+    {undefined, undefined};
+get_os_user_data(UserId) ->
+    %% GET /v2.0/users/<user-id>
+    RequestURI = users_url() ++ UserId,
+    Response = httpc:request(get, {RequestURI, []}, [], []),
+    handle_user_data_response(Response).
+
+get_ec2_creds(undefined, _) ->
+    {undefined, undefined};
+get_ec2_creds(UserId, TenantId) ->
+    %% GET /v2.0/users/<user-id>
+    RequestURI = users_url() ++ UserId ++ "/credentials/OS-EC2",
+    Response = httpc:request(get, {RequestURI, []}, [], []),
+    handle_ec2_creds_response(Response, TenantId).
+
+handle_user_data_response({ok, {{_HTTPVer, _Status, _StatusLine}, _, UserInfo}})
+  when _Status >= 200, _Status =< 299 ->
+    case catch mochijson2:decode(UserInfo) of
+        {struct, UserItems} ->
+            user_name_and_email(UserItems);
+        {'EXIT', _} ->
+            %% @TODO Log error
+            {undefined, undefined}
+    end;
+handle_user_data_response({ok, {{_HTTPVer, _Status, _StatusLine}, _, _}}) ->
+    %% @TODO Log error
+    {undefined, undefined};
+handle_user_data_response({error, Reason}) ->
+    lager:warning("Error occurred requesting user data from keystone. Reason: ~p",
+                  [Reason]),
+    {undefined, undefined}.
+
+user_name_and_email(Items) ->
+    {struct, UserItems} = proplists:get_value(<<"user">>, Items, []),
+    {proplists:get_value(<<"name">>, UserItems),
+     proplists:get_value(<<"email">>, UserItems)}.
+
+ec2_creds_for_tenant([], _) ->
+    {undefined, undefined};
+ec2_creds_for_tenant([HeadCreds | RestCreds], TenantId) ->
+    case proplists:get_value(<<"tenant_id">>, HeadCreds) of
+        TenantId ->
+            {proplists:get_value(<<"access">>, HeadCreds),
+             proplists:get_value(<<"secret">>, HeadCreds)};
+        _ ->
+            ec2_creds_for_tenant(RestCreds, TenantId)
+    end.
+
+handle_ec2_creds_response({ok, {{_HTTPVer, _Status, _StatusLine}, _, CredsInfo}}, TenantId)
+  when _Status >= 200, _Status =< 299 ->
+    case catch mochijson2:decode(CredsInfo) of
+        {struct, Items} ->
+            {struct, CredsItems} = proplists:get_value(<<"credentials">>, Items, []),
+            ec2_creds_for_tenant(CredsItems, TenantId);
+        {'EXIT', _} ->
+            %% @TODO Log error
+            {undefined, undefined}
+    end;
+handle_ec2_creds_response({ok, {{_HTTPVer, _Status, _StatusLine}, _, _}}, _) ->
+    %% @TODO Log error
+    {undefined, undefined};
+handle_ec2_creds_response({error, Reason}, _) ->
+    lager:warning("Error occurred requesting user EC2 credentials from keystone. Reason: ~p",
+                  [Reason]),
+    {undefined, undefined}.
+
+users_url() ->
+    riak_cs_utils:get_env(riak_cs, os_users_url, ?DEFAULT_OS_USERS_URL).
 
 %% @doc Get the list of methods a resource supports.
 -spec allowed_methods(#wm_reqdata{}, #context{}) -> {[atom()], #wm_reqdata{}, #context{}}.
@@ -524,15 +600,3 @@ default_anon_ok() ->
 -spec default_authorize(term(), term()) -> {false, term(), term()}.
 default_authorize(RD, Ctx) ->
     {false, RD, Ctx}.
-
--spec api() -> s3 | oos.
-api() ->
-    api(application:get_env(riak_cs, rewrite_module)).
-
--spec api({ok, atom()} | undefined) -> s3 | oos.
-api({ok, ?S3_API_MOD}) ->
-    s3;
-api({ok, ?OOS_API_MOD}) ->
-    oos;
-api(undefined) ->
-    oos.
