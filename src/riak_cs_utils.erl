@@ -32,6 +32,7 @@
          close_riak_connection/2,
          create_bucket/5,
          create_user/2,
+         create_user/4,
          cs_version/0,
          delete_bucket/4,
          delete_object/3,
@@ -252,9 +253,15 @@ dash_char(Char) ->
 %% @doc Create a new Riak CS user
 -spec create_user(string(), string()) -> {ok, rcs_user()} | {error, term()}.
 create_user(Name, Email) ->
+    {KeyId, Secret} = generate_access_creds(Email),
+    create_user(Name, Email, KeyId, Secret).
+
+%% @doc Create a new Riak CS user
+-spec create_user(string(), string(), string(), string()) -> {ok, rcs_user()} | {error, term()}.
+create_user(Name, Email, KeyId, Secret) ->
     case validate_email(Email) of
         ok ->
-            User = user_record(Name, Email),
+            User = user_record(Name, Email, KeyId, Secret),
             create_credentialed_user(get_admin_creds(), User);
         {error, _Reason}=Error ->
             Error
@@ -270,7 +277,7 @@ create_credentialed_user({ok, AdminCreds}, User) ->
     {StIp, StPort, StSSL} = stanchion_data(),
     UserDoc = user_json(User),
     %% Make a call to the user request serialization service.
-    Result = velvet:create_user(StIp, StPort, "application/json", UserDoc, 
+    Result = velvet:create_user(StIp, StPort, "application/json", UserDoc,
         [{ssl, StSSL}, {auth_creds, AdminCreds}]),
     handle_create_user(Result, User).
 
@@ -1412,15 +1419,15 @@ update_user_record(User=#moss_user_v1{}) ->
 
 %% @doc Return a user record for the specified user name and
 %% email address.
--spec user_record(string(), string()) -> rcs_user().
-user_record(Name, Email) ->
-    user_record(Name, Email, []).
+-spec user_record(string(), string(), string(), string()) -> rcs_user().
+user_record(Name, Email, KeyId, Secret) ->
+    user_record(Name, Email, KeyId, Secret, []).
 
 %% @doc Return a user record for the specified user name and
 %% email address.
--spec user_record(string(), string(), [cs_bucket()]) -> rcs_user().
-user_record(Name, Email, Buckets) ->
-    {KeyId, Secret} = generate_access_creds(Email),
+-spec user_record(string(), string(), string(), string(), [cs_bucket()]) ->
+                         rcs_user().
+user_record(Name, Email, KeyId, Secret, Buckets) ->
     CanonicalId = generate_canonical_id(KeyId, Secret),
     DisplayName = display_name(Email),
     ?RCS_USER{name=Name,

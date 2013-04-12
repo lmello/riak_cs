@@ -165,7 +165,8 @@ forbidden(RD, Ctx=#context{auth_module=AuthMod,
                                            [riak_cs_wm_utils:extract_name(UserKey)]),
                 UserLookupResult = maybe_create_user(
                                      riak_cs_utils:get_user(UserKey, RiakPid),
-                                     Ctx#context.api),
+                                     Ctx#context.api,
+                                     AuthData),
                 {authenticate(UserLookupResult, RD, Ctx, AuthData),
                  resource_call(Mod, anon_ok, [], ExportsFun)};
             failed ->
@@ -186,19 +187,31 @@ forbidden(RD, Ctx=#context{auth_module=AuthMod,
             Ret
     end.
 
-maybe_create_user({ok, {_, _}}=UserResult, _) ->
+maybe_create_user({ok, {_, _}}=UserResult, _, _) ->
     UserResult;
-maybe_create_user({error, NE}, oos) when NE =:= not_found;
-                                         NE =:= notfound;
-                                         NE =:= no_user_key ->
+maybe_create_user({error, NE}, oos, AuthData) when NE =:= not_found;
+                                                   NE =:= notfound;
+                                                   NE =:= no_user_key ->
     %% @TODO Attempt to create a Riak CS user to represent the OS tenant
+    {TenantId, _TokenItems} = AuthData,
+    %% @TODO Get username from `TokenItems'
+    %% @TODO Get user's email
+    %% GET /v2.0/users/<user-id>
     %% @TODO Get the user's key secret
     %% GET /v2.0/users/<user-id>/credentials/OS-EC2/<ec2-access-key>
-    undefined;
-maybe_create_user({error, Reason}=Error, Api) ->
+    %% If the user does not have ec2 credentials, then set `key_secret'
+    %% to `undefined'.
+    Name = "",
+    Email = "",
+    Secret = "",
+    handle_create_user_response(riak_cs_utils:create_user(Name, Email, TenantId, Secret));
+maybe_create_user({error, Reason}=Error, Api, _) ->
     _ = lager:error("Retrieval of user record for ~p failed. Reason: ~p",
                     [Api, Reason]),
     Error.
+
+handle_create_user_response(ok) ->
+    ok.
 
 %% @doc Get the list of methods a resource supports.
 -spec allowed_methods(#wm_reqdata{}, #context{}) -> {[atom()], #wm_reqdata{}, #context{}}.
